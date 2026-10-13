@@ -9,6 +9,7 @@ import json
 import pytest
 
 from lab_solution import (
+    _move_model_inputs,
     collate_examples,
     find_lora_target_names,
     greedy_iou_reward,
@@ -146,3 +147,39 @@ def test_prediction_previews_save_requested_images(tmp_path):
     assert len(output) == 1
     assert output[0].is_file()
     assert Image.open(output[0]).size == (64, 36)
+
+
+def test_model_input_cast_finds_nested_qwen_visual_module():
+    torch = pytest.importorskip("torch")
+
+    class VisionTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
+
+    class QwenCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = VisionTower()
+            self.embedding = torch.nn.Embedding(8, 2)
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+    class QwenWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = QwenCore()
+
+        def get_input_embeddings(self):
+            return self.model.get_input_embeddings()
+
+    wrapper = QwenWrapper()
+    moved = _move_model_inputs(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "pixel_values": torch.ones((2, 3), dtype=torch.float32),
+        },
+        wrapper,
+    )
+    assert moved["pixel_values"].dtype == torch.float16

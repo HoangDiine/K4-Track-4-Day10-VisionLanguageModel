@@ -420,14 +420,38 @@ def _model_device(model: Any):
         return next(model.parameters()).device
 
 
+def _find_visual_module(model: Any) -> Any | None:
+    """Find Qwen3-VL's vision tower across base and PEFT wrapper layers."""
+    pending = [model]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        visual = getattr(candidate, "visual", None)
+        if visual is not None:
+            return visual
+        nested = getattr(candidate, "model", None)
+        if nested is not None and nested is not candidate:
+            pending.append(nested)
+        get_base_model = getattr(candidate, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                base_model = get_base_model()
+            except (AttributeError, RuntimeError):
+                base_model = None
+            if base_model is not candidate:
+                pending.append(base_model)
+    return None
+
+
 def _move_model_inputs(encoded: Mapping[str, Any], model: Any) -> dict[str, Any]:
     import torch
 
     device = _model_device(model)
     visual_dtype = None
-    visual = getattr(model, "visual", None)
-    if visual is None and hasattr(model, "get_base_model"):
-        visual = getattr(model.get_base_model(), "visual", None)
+    visual = _find_visual_module(model)
     if visual is not None:
         visual_dtype = next(visual.parameters()).dtype
     moved: dict[str, Any] = {}
