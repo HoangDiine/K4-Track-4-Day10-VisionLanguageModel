@@ -1,0 +1,13 @@
+{
+  "name": "E4_rank_selection",
+  "selected_rank": 64,
+  "candidate_ranks": [4, 64],
+  "selection_metric": "micro_f1",
+  "n_images": 40,
+  "micro": {
+    "f1": 0.3763440860215054
+  },
+  "dataset_version": "d10-21e4070301",
+  "split": "val",
+  "score_version": 1
+}

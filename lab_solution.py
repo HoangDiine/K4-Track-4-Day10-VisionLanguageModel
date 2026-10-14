@@ -18,6 +18,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 CLASSES = ("pothole", "crack", "manhole")
 MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
+# Keep E3's vision blocks quantized as they were during training, but leave the
+# merger projectors dense so their saved full-precision weights can be restored.
+BNB_SKIP_MODULES = (
+    "model.visual.merger",
+    "model.visual.deepstack_merger_list",
+    "lm_head",
+)
 PROMPTS = {
     "norm1000": (
         "Inspect this 640x360 dashcam image for road damage. Detect only pothole, "
@@ -384,8 +391,9 @@ def grpo_iou_reward(completions: Sequence[Any], solution: Sequence[Any], **_: An
 
 
 def load_qwen3vl(model_id: str = MODEL_ID) -> tuple[Any, Any]:
-    """Load the lab's NF4 model on one CUDA GPU, leaving vision/lm_head in fp16."""
+    """Load NF4 weights on CUDA, keeping merger projectors and lm_head dense."""
     import torch
+    from bitsandbytes.nn import Linear4bit
     from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
 
     if not torch.cuda.is_available():
@@ -395,7 +403,7 @@ def load_qwen3vl(model_id: str = MODEL_ID) -> tuple[Any, Any]:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.float16,
-        llm_int8_skip_modules=["visual", "lm_head"],
+        llm_int8_skip_modules=list(BNB_SKIP_MODULES),
     )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_id,
@@ -404,6 +412,20 @@ def load_qwen3vl(model_id: str = MODEL_ID) -> tuple[Any, Any]:
         device_map={"": 0},
         low_cpu_mem_usage=True,
     )
+    quantized_projectors = [
+        name
+        for name, module in model.named_modules()
+        if (
+            name.startswith("model.visual.merger.")
+            or name.startswith("model.visual.deepstack_merger_list.")
+        )
+        and isinstance(module, Linear4bit)
+    ]
+    if quantized_projectors:
+        raise RuntimeError(
+            "Qwen3-VL merger projectors must remain full precision; "
+            f"found 4-bit modules: {quantized_projectors[:8]}"
+        )
     processor = AutoProcessor.from_pretrained(model_id)
     processor.tokenizer.padding_side = "left"
     if getattr(processor.tokenizer, "pad_token_id", None) is None:
@@ -798,6 +820,7 @@ def train_setup(
     run_root = Path(output_root) / run_name
     losses: list[float] = []
     skipped_updates = 0
+    consecutive_skips = 0
     successful_steps = 0
     iterator = iter(loader)
     optimizer.zero_grad(set_to_none=True)
@@ -829,10 +852,13 @@ def train_setup(
         if not bool(torch.isfinite(grad_norm).item()):
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
-            skipped_updates += 1
-            if skipped_updates >= 5:
-                raise FloatingPointError("five consecutive non-finite gradient updates; stopping")
-            print(f"non-finite gradient norm; skipped update {skipped_updates}/5")
+            skipped_updates, consecutive_skips = _update_skip_counters(
+                skipped_updates, consecutive_skips, successful_update=False
+            )
+            print(
+                f"non-finite gradient norm; skipped update {skipped_updates} total "
+                f"({consecutive_skips}/5 consecutive)"
+            )
             continue
         scale_before = scaler.get_scale()
         scaler.step(optimizer)
@@ -840,12 +866,18 @@ def train_setup(
         optimizer.zero_grad(set_to_none=True)
         scale_after = scaler.get_scale()
         if scale_after < scale_before:
-            skipped_updates += 1
-            if skipped_updates >= 5:
-                raise FloatingPointError("five consecutive fp16 overflow updates; stopping")
-            print(f"GradScaler skipped overflow update {skipped_updates}/5")
+            skipped_updates, consecutive_skips = _update_skip_counters(
+                skipped_updates, consecutive_skips, successful_update=False
+            )
+            print(
+                f"GradScaler skipped overflow update {skipped_updates} total "
+                f"({consecutive_skips}/5 consecutive)"
+            )
             continue
 
+        skipped_updates, consecutive_skips = _update_skip_counters(
+            skipped_updates, consecutive_skips, successful_update=True
+        )
         scheduler.step()
         successful_steps += 1
         step_loss = sum(accumulated_losses) / len(accumulated_losses)
@@ -913,17 +945,52 @@ def load_trained_setup(
     model, processor = load_qwen3vl(model_id)
     model = PeftModel.from_pretrained(model, run_root / "adapter", is_trainable=False)
     if setup in {"E2", "E3"}:
-        parameters = dict(model.named_parameters())
-        for name, parameter in parameters.items():
-            if "visual.merger" in name or "visual.deepstack_merger_list" in name:
-                parameter.data = parameter.data.to(dtype=torch.float32)
         weights = torch.load(run_root / "projector.pt", map_location="cpu", weights_only=True)
-        missing = set(weights) - set(parameters)
-        if missing:
-            raise RuntimeError(f"saved projector keys are absent from this model: {sorted(missing)[:5]}")
-        with torch.no_grad():
-            for name, value in weights.items():
-                parameters[name].copy_(value.to(device=parameters[name].device, dtype=torch.float32))
+        _restore_projector_weights(model, weights)
     model.eval()
     return model, processor
+
+
+def _restore_projector_weights(model: Any, weights: Mapping[str, Any]) -> None:
+    """Restore projector values after validating keys and dense tensor shapes."""
+    import torch
+
+    parameters = dict(model.named_parameters())
+    missing = set(weights) - set(parameters)
+    if missing:
+        raise RuntimeError(f"saved projector keys are absent from this model: {sorted(missing)[:5]}")
+    shape_mismatches = {
+        name: (tuple(value.shape), tuple(parameters[name].shape))
+        for name, value in weights.items()
+        if tuple(value.shape) != tuple(parameters[name].shape)
+    }
+    if shape_mismatches:
+        details = "; ".join(
+            f"{name}: checkpoint={checkpoint_shape}, model={model_shape}"
+            for name, (checkpoint_shape, model_shape) in list(shape_mismatches.items())[:5]
+        )
+        raise RuntimeError(f"saved projector shape mismatch: {details}")
+    with torch.no_grad():
+        for name, value in weights.items():
+            parameter = parameters[name]
+            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+
+def _update_skip_counters(
+    total_skips: int,
+    consecutive_skips: int,
+    *,
+    successful_update: bool,
+    max_consecutive_skips: int = 5,
+) -> tuple[int, int]:
+    """Count skipped optimizer updates and stop only on repeated consecutive skips."""
+    if successful_update:
+        return total_skips, 0
+    total_skips += 1
+    consecutive_skips += 1
+    if consecutive_skips >= max_consecutive_skips:
+        raise FloatingPointError(
+            f"{max_consecutive_skips} consecutive non-finite gradient updates; stopping"
+        )
+    return total_skips, consecutive_skips
 

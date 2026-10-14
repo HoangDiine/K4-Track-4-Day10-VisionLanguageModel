@@ -1,0 +1,66 @@
+{
+  "n_images": 311,
+  "parse_valid_rate": 1.0,
+  "missing_predictions": 0,
+  "micro": {
+    "precision": 0.444,
+    "recall": 0.38078902229845624,
+    "f1": 0.4099722991689751,
+    "tp": 222,
+    "fp": 278,
+    "fn": 361
+  },
+  "per_class": {
+    "pothole": {
+      "precision": 0.32653061224489793,
+      "recall": 0.2644628099173554,
+      "f1": 0.29223744292237447,
+      "tp": 32,
+      "fp": 66,
+      "fn": 89
+    },
+    "crack": {
+      "precision": 0.3602693602693603,
+      "recall": 0.35785953177257523,
+      "f1": 0.3590604026845638,
+      "tp": 107,
+      "fp": 190,
+      "fn": 192
+    },
+    "manhole": {
+      "precision": 0.7904761904761904,
+      "recall": 0.50920245398773,
+      "f1": 0.6194029850746268,
+      "tp": 83,
+      "fp": 22,
+      "fn": 80
+    },
+    "other": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    }
+  },
+  "mean_iou": 0.6958658039615104,
+  "fp_per_image": 0.8938906752411575,
+  "f1_ci95": [
+    0.3685185185185185,
+    0.4513618677042802
+  ],
+  "score_version": 1,
+  "name": "E3",
+  "dataset_version": "d10-21e4070301",
+  "split": "test",
+  "coord": "norm1000",
+  "meta": {
+    "trainable_params": 148426752,
+    "trainable_projector_params": 109105152,
+    "peak_vram_gb": 12.705136776,
+    "train_minutes": 22.9734055481,
+    "successful_steps": 300,
+    "skipped_updates": 3
+  }
+}

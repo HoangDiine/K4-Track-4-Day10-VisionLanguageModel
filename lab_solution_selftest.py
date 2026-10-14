@@ -9,7 +9,10 @@ import json
 import pytest
 
 from lab_solution import (
+    BNB_SKIP_MODULES,
     _move_model_inputs,
+    _restore_projector_weights,
+    _update_skip_counters,
     collate_examples,
     find_lora_target_names,
     greedy_iou_reward,
@@ -91,6 +94,74 @@ def test_lora_target_counts_match_qwen3_vl_lab_contract():
     assert len(find_lora_target_names(names, "E1")) == 252
     assert len(find_lora_target_names(names, "E2")) == 252
     assert len(find_lora_target_names(names, "E3")) == 348
+
+
+def test_quantization_skip_patterns_keep_qwen_projectors_dense():
+    assert "model.visual.merger" in BNB_SKIP_MODULES
+    assert "model.visual.deepstack_merger_list" in BNB_SKIP_MODULES
+    assert "model.visual" not in BNB_SKIP_MODULES
+    assert "lm_head" in BNB_SKIP_MODULES
+
+
+def test_projector_restore_uses_inference_parameter_dtype():
+    torch = pytest.importorskip("torch")
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = torch.nn.Module()
+            self.visual.merger = torch.nn.LayerNorm(2).to(dtype=torch.float16)
+
+    model = Model()
+    weights = {
+        "visual.merger.weight": torch.tensor([1.25, 0.75], dtype=torch.float32),
+        "visual.merger.bias": torch.tensor([0.5, -0.5], dtype=torch.float32),
+    }
+    _restore_projector_weights(model, weights)
+
+    assert model.visual.merger.weight.dtype == torch.float16
+    assert torch.equal(model.visual.merger.weight, weights["visual.merger.weight"].half())
+    assert torch.equal(model.visual.merger.bias, weights["visual.merger.bias"].half())
+
+
+def test_projector_restore_rejects_shape_mismatch_before_copying_any_weights():
+    torch = pytest.importorskip("torch")
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.tensor([1.0]))
+            self.second = torch.nn.Parameter(torch.zeros(2, 2))
+
+    model = Model()
+    weights = {
+        "first": torch.tensor([9.0]),
+        "second": torch.ones(3, 3),
+    }
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        _restore_projector_weights(model, weights)
+
+    assert torch.equal(model.first, torch.tensor([1.0]))
+
+
+def test_skip_limit_counts_consecutive_failures_not_total_failures():
+    total, consecutive = 0, 0
+    for _ in range(5):
+        total, consecutive = _update_skip_counters(
+            total, consecutive, successful_update=False
+        )
+        total, consecutive = _update_skip_counters(
+            total, consecutive, successful_update=True
+        )
+    assert (total, consecutive) == (5, 0)
+
+    for _ in range(4):
+        total, consecutive = _update_skip_counters(
+            total, consecutive, successful_update=False
+        )
+    with pytest.raises(FloatingPointError, match="5 consecutive"):
+        _update_skip_counters(total, consecutive, successful_update=False)
 
 
 def test_collator_pads_text_and_masks_labels_but_concatenates_images():
